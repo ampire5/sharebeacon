@@ -674,3 +674,23 @@ struct NetFSShareMounter: ShareMounting {
         }
     }
 }
+
+/// The Finder lists a share can be restored into.
+enum FinderFavoriteTarget: String, CaseIterable, Sendable {
+    case volumes
+    case items
+}
+
+/// Writes one mount into the first Finder favorites list that accepts it.
+///
+/// Finder renders the volume list and the item list in the same Favorites
+/// section of the sidebar, and in the same section of the open and save
+/// panels. Writing a single mount into both lists therefore shows it twice, so
+/// the volume list is preferred and the item list is only a fallback for when
+/// the volume list rejects the insert.
+func restoreFinderFavorite(
+    targets: [FinderFavoriteTarget] = FinderFavoriteTarget.allCases,
+    write: (FinderFavoriteTarget) -> Bool
+) -> Bool {
+    targets.contains { write($0) }
+}

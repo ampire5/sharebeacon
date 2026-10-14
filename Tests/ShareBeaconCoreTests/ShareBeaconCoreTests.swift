@@ -294,4 +294,48 @@ struct ShareBeaconCoreTests {
             defaultDirectory: volumes
         ) == "\(volumes)/docs")
     }
+
+    @Test("finder favorite prefers the volume list over the item list")
+    func finderFavoritePrefersVolumeList() {
+        #expect(FinderFavoriteTarget.allCases == [.volumes, .items])
+    }
+
+    @Test("finder favorite writes only the volume list when it succeeds")
+    func finderFavoriteStopsAfterVolumeSuccess() {
+        var attempted: [FinderFavoriteTarget] = []
+
+        let restored = restoreFinderFavorite { target in
+            attempted.append(target)
+            return target == .volumes
+        }
+
+        #expect(restored)
+        #expect(attempted == [.volumes])
+    }
+
+    @Test("finder favorite falls back to the item list when the volume list fails")
+    func finderFavoriteFallsBackToItemList() {
+        var attempted: [FinderFavoriteTarget] = []
+
+        let restored = restoreFinderFavorite { target in
+            attempted.append(target)
+            return target == .items
+        }
+
+        #expect(restored)
+        #expect(attempted == [.volumes, .items])
+    }
+
+    @Test("finder favorite reports failure when every list rejects the mount")
+    func finderFavoriteFailsWhenEveryListRejects() {
+        var attempted: [FinderFavoriteTarget] = []
+
+        let restored = restoreFinderFavorite { target in
+            attempted.append(target)
+            return false
+        }
+
+        #expect(!restored)
+        #expect(attempted == [.volumes, .items])
+    }
 }

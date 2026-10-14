@@ -10,19 +10,31 @@ struct FinderSidebarRepairer: FinderSidebarRepairing {
     func restoreFavorite(for share: ShareConfiguration, at mountPoint: String? = nil) -> Bool {
         let path = mountPoint ?? share.normalizedMountPoint
         let mountURL = URL(fileURLWithPath: path, isDirectory: true)
-        let volumeResult = restore(
-            mountURL: mountURL,
-            name: share.name,
-            listType: kLSSharedFileListFavoriteVolumes.takeUnretainedValue(),
-            label: "Favorite Volumes"
-        )
-        let itemResult = restore(
-            mountURL: mountURL,
-            name: share.name,
-            listType: kLSSharedFileListFavoriteItems.takeUnretainedValue(),
-            label: "Favorites"
-        )
-        return volumeResult || itemResult
+        return restoreFinderFavorite { target in
+            restore(
+                mountURL: mountURL,
+                name: share.name,
+                target: target
+            )
+        }
+    }
+
+    private func restore(
+        mountURL: URL,
+        name: String,
+        target: FinderFavoriteTarget
+    ) -> Bool {
+        let listType: CFString
+        let label: String
+        switch target {
+        case .volumes:
+            listType = kLSSharedFileListFavoriteVolumes.takeUnretainedValue()
+            label = "Favorite Volumes"
+        case .items:
+            listType = kLSSharedFileListFavoriteItems.takeUnretainedValue()
+            label = "Favorites"
+        }
+        return restore(mountURL: mountURL, name: name, listType: listType, label: label)
     }
 
     private func restore(
