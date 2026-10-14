@@ -42,6 +42,22 @@ struct SharedCredential: Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// Whether ShareBeacon puts a share back into the Finder favorites after a
+/// successful mount. A share may follow the general setting or override it.
+enum FinderFavoritePreference: String, Codable, CaseIterable, Sendable {
+    case followGeneral
+    case always
+    case never
+
+    func resolves(generalDefault: Bool) -> Bool {
+        switch self {
+        case .followGeneral: return generalDefault
+        case .always: return true
+        case .never: return false
+        }
+    }
+}
+
 struct ShareConfiguration: Codable, Identifiable, Equatable, Sendable {
     var id: UUID
     var name: String
@@ -51,6 +67,7 @@ struct ShareConfiguration: Codable, Identifiable, Equatable, Sendable {
     var mountPoint: String
     var isEnabled: Bool
     var autoMount: Bool
+    var favoritePreference: FinderFavoritePreference
     var sharedCredential: SharedCredential?
 
     init(
@@ -62,6 +79,7 @@ struct ShareConfiguration: Codable, Identifiable, Equatable, Sendable {
         mountPoint: String,
         isEnabled: Bool,
         autoMount: Bool = true,
+        favoritePreference: FinderFavoritePreference = .followGeneral,
         sharedCredential: SharedCredential? = nil
     ) {
         self.id = id
@@ -72,11 +90,14 @@ struct ShareConfiguration: Codable, Identifiable, Equatable, Sendable {
         self.mountPoint = mountPoint
         self.isEnabled = isEnabled
         self.autoMount = autoMount
+        self.favoritePreference = favoritePreference
         self.sharedCredential = sharedCredential
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, host, shareName, username, mountPoint, isEnabled, autoMount, sharedCredential
+        case id, name, host, shareName, username, mountPoint, isEnabled, autoMount
+        case favoritePreference
+        case sharedCredential
     }
 
     init(from decoder: Decoder) throws {
@@ -89,10 +110,21 @@ struct ShareConfiguration: Codable, Identifiable, Equatable, Sendable {
         mountPoint = try container.decode(String.self, forKey: .mountPoint)
         isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
         autoMount = try container.decodeIfPresent(Bool.self, forKey: .autoMount) ?? true
+        favoritePreference = try container.decodeIfPresent(
+            FinderFavoritePreference.self,
+            forKey: .favoritePreference
+        ) ?? .followGeneral
         sharedCredential = try container.decodeIfPresent(
             SharedCredential.self,
             forKey: .sharedCredential
         )
+    }
+
+    /// Whether ShareBeacon restores the mount into the Finder favorites after a
+    /// successful mount. A share that follows the general setting uses the
+    /// general default.
+    func restoresFavorite(generalDefault: Bool) -> Bool {
+        favoritePreference.resolves(generalDefault: generalDefault)
     }
 
     static func validate(_ shares: [ShareConfiguration]) throws {

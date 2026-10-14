@@ -52,6 +52,7 @@ enum ShareRuntimeState: Equatable {
 final class SMBShareManager: NSObject {
     private(set) var shares: [ShareConfiguration] = []
     private(set) var states: [UUID: ShareRuntimeState] = [:]
+    private(set) var restoresFavoritesByDefault = true
 
     @ObservationIgnored private let credentialStore: CredentialStoring
     @ObservationIgnored private let endpointChecker: EndpointChecking
@@ -59,6 +60,7 @@ final class SMBShareManager: NSObject {
     @ObservationIgnored private let finderSidebarRepairer: FinderSidebarRepairing
     @ObservationIgnored private let defaults: UserDefaults
     private let saveKey = "shareBeaconShares"
+    private let favoriteKey = "shareBeaconRestoresFavorites"
     private let retryInterval: TimeInterval = 60
     private let reachabilityTimeout: TimeInterval = 120
     private let wakeGraceInterval: TimeInterval = 5
@@ -85,6 +87,7 @@ final class SMBShareManager: NSObject {
         self.finderSidebarRepairer = finderSidebarRepairer
         self.defaults = defaults
         super.init()
+        restoresFavoritesByDefault = defaults.object(forKey: favoriteKey) as? Bool ?? true
         loadShares()
         refreshMountStates()
         startMonitoring()
@@ -227,7 +230,7 @@ final class SMBShareManager: NSObject {
                     "\(share.name) is already mounted at \(existingPoint); using the existing mount.",
                     level: .warning
                 )
-                if finderSidebarRepairer.restoreFavorite(for: share, at: existingPoint) {
+                if restoreFavoriteIfEnabled(for: share, at: existingPoint) {
                     appendLog("Restored Finder favorite for \(share.name).")
                 }
             }
@@ -293,7 +296,7 @@ final class SMBShareManager: NSObject {
                 try await operationRunner.mount(mounter, share: share, password: password)
                 states[share.id] = .mounted
                 appendLog("Mounted \(share.name) at \(share.normalizedMountPoint).")
-                if finderSidebarRepairer.restoreFavorite(for: share, at: nil) {
+                if restoreFavoriteIfEnabled(for: share, at: nil) {
                     appendLog("Restored Finder favorite for \(share.name).")
                 }
             } catch {
@@ -305,7 +308,7 @@ final class SMBShareManager: NSObject {
                         "\(share.name) is already mounted at \(existingPoint); using the existing mount.",
                         level: .warning
                     )
-                    if finderSidebarRepairer.restoreFavorite(
+                    if restoreFavoriteIfEnabled(
                         for: share,
                         at: existingPoint == configuredPoint ? nil : existingPoint
                     ) {
@@ -399,6 +402,18 @@ final class SMBShareManager: NSObject {
     private func saveShares() {
         guard let data = try? JSONEncoder().encode(shares) else { return }
         defaults.set(data, forKey: saveKey)
+    }
+
+    func setRestoresFavoritesByDefault(_ enabled: Bool) {
+        restoresFavoritesByDefault = enabled
+        defaults.set(enabled, forKey: favoriteKey)
+    }
+
+    /// Restores the Finder favorite only when the share asks for it. The manual
+    /// Add to Finder Favorites action bypasses this and always writes.
+    private func restoreFavoriteIfEnabled(for share: ShareConfiguration, at mountPoint: String?) -> Bool {
+        guard share.restoresFavorite(generalDefault: restoresFavoritesByDefault) else { return false }
+        return finderSidebarRepairer.restoreFavorite(for: share, at: mountPoint)
     }
 
     private func startMonitoring() {

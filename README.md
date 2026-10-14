@@ -18,6 +18,7 @@ reconnects.
 - User-owned mount points by default, without requiring administrator privileges; custom paths such as `/Volumes` are supported
 - Settings window with Shares, General, and Log tabs (live log with level filter)
 - Finder sidebar favorite repair with a safe no-op fallback
+- Per-share Finder favorite preference with a general default and per-share override
 - Liquid Glass controls via the macOS 26 and 27 design system
 - macOS 26 or newer, Apple Silicon and Intel
 
@@ -109,6 +110,11 @@ To create a favorite initially, configure and save the share, mount it, then
 choose **Add to Finder Favorites** from that share's menu. ShareBeacon also
 attempts this automatically after every successful reconnect. If Finder does
 not refresh immediately, relaunch Finder once.
+
+Each share carries a **Finder favorite** preference of Follow General, Always
+or Never, and the general setting in the General tab decides what Follow
+General means. Setting a share to Always or Never overrides that default. The
+manual Add to Finder Favorites action is always available and ignores both.
 
 ## Sleep Mode
 

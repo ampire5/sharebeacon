@@ -197,6 +197,72 @@ struct ShareBeaconCoreTests {
 
         #expect(decoded.autoMount)
         #expect(decoded.sharedCredential == nil)
+        #expect(decoded.favoritePreference == .followGeneral)
+        #expect(decoded.restoresFavorite(generalDefault: true))
+        #expect(decoded.restoresFavorite(generalDefault: false) == false)
+    }
+
+    @Test("share without a favorite preference follows the general default")
+    func favoritePreferenceFollowsGeneralDefault() {
+        let share = ShareConfiguration(
+            name: "NAS",
+            host: "nas.example.test",
+            shareName: "data",
+            username: "user",
+            mountPoint: "/Volumes/data",
+            isEnabled: true
+        )
+
+        #expect(share.favoritePreference == .followGeneral)
+        #expect(share.restoresFavorite(generalDefault: true))
+        #expect(share.restoresFavorite(generalDefault: false) == false)
+    }
+
+    @Test("share favorite preference overrides the general default")
+    func favoritePreferenceOverridesGeneralDefault() {
+        let always = ShareConfiguration(
+            name: "NAS",
+            host: "nas.example.test",
+            shareName: "data",
+            username: "user",
+            mountPoint: "/Volumes/data",
+            isEnabled: true,
+            favoritePreference: .always
+        )
+        let never = ShareConfiguration(
+            name: "NAS",
+            host: "nas.example.test",
+            shareName: "data",
+            username: "user",
+            mountPoint: "/Volumes/data",
+            isEnabled: true,
+            favoritePreference: .never
+        )
+
+        #expect(always.restoresFavorite(generalDefault: false))
+        #expect(never.restoresFavorite(generalDefault: true) == false)
+    }
+
+    @Test("favorite preference survives an encode and decode round trip")
+    func favoritePreferenceSurvivesRoundTrip() throws {
+        for preference in FinderFavoritePreference.allCases {
+            let share = ShareConfiguration(
+                name: "NAS",
+                host: "nas.example.test",
+                shareName: "data",
+                username: "user",
+                mountPoint: "/Volumes/data",
+                isEnabled: true,
+                favoritePreference: preference
+            )
+            let encoded = try JSONEncoder().encode([share])
+            let decoded = try JSONDecoder().decode(
+                [ShareConfiguration].self,
+                from: encoded
+            )
+
+            #expect(decoded.first?.favoritePreference == preference)
+        }
     }
 
     @Test("shared credential survives an encode and decode round trip")

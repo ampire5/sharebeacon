@@ -162,6 +162,16 @@ struct SettingsView: View {
                 }
             }
             Section {
+                Toggle(isOn: restoresFavoritesBinding) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Restore Finder favorites")
+                        Text("Put every mounted share back into the Finder favorites after a reconnect.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Section {
                 LabeledContent("Project") {
                     Link(destination: AppMetadata.projectURL) {
                         Label("mjoe/sharebeacon", systemImage: "arrow.up.right.square")
@@ -173,6 +183,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var restoresFavoritesBinding: Binding<Bool> {
+        Binding(
+            get: { manager.restoresFavoritesByDefault },
+            set: { manager.setRestoresFavoritesByDefault($0) }
+        )
     }
 
     private var launchAtLoginBinding: Binding<Bool> {
@@ -464,6 +481,12 @@ private struct ShareEditorView: View {
                     .foregroundStyle(.secondary)
                 Toggle("Share is active", isOn: $share.isEnabled)
                 Toggle("Mount automatically when available", isOn: $share.autoMount)
+                Picker("Finder favorite", selection: $share.favoritePreference) {
+                    Text("Follow General").tag(FinderFavoritePreference.followGeneral)
+                    Text("Always").tag(FinderFavoritePreference.always)
+                    Text("Never").tag(FinderFavoritePreference.never)
+                }
+                .help("Whether ShareBeacon puts this share back into the Finder favorites after a mount")
 
                 if let errorMessage {
                     Text(errorMessage)
