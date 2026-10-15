@@ -404,4 +404,50 @@ struct ShareBeaconCoreTests {
         #expect(!restored)
         #expect(attempted == [.volumes, .items])
     }
+
+    @Test("finder favorite plan collapses duplicates onto the first entry")
+    func planCollapsesDuplicates() {
+        let candidates = [
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/other"),
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/data"),
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/data"),
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/data")
+        ]
+
+        #expect(finderFavoritePlan(
+            candidates: candidates,
+            mountPath: "/Users/tester/Volumes/data"
+        ) == .collapseDuplicates(keep: 1, drop: [2, 3]))
+    }
+
+    @Test("finder favorite plan keeps a single existing entry untouched")
+    func planKeepsSingleEntry() {
+        let candidates = [
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/other"),
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/data")
+        ]
+
+        #expect(finderFavoritePlan(
+            candidates: candidates,
+            mountPath: "/Users/tester/Volumes/data"
+        ) == .collapseDuplicates(keep: 1, drop: []))
+    }
+
+    @Test("finder favorite plan inserts when no entry matches")
+    func planInsertsWhenNothingMatches() {
+        let candidates = [
+            FinderFavoriteCandidate(resolvedPath: "/Users/tester/Volumes/other"),
+            FinderFavoriteCandidate(resolvedPath: nil)
+        ]
+
+        #expect(finderFavoritePlan(
+            candidates: candidates,
+            mountPath: "/Users/tester/Volumes/data"
+        ) == .insertNew)
+    }
+
+    @Test("finder favorite plan inserts on an empty list")
+    func planInsertsOnEmptyList() {
+        #expect(finderFavoritePlan(candidates: [], mountPath: "/Users/tester/Volumes/data") == .insertNew)
+    }
 }

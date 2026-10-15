@@ -726,3 +726,35 @@ func restoreFinderFavorite(
 ) -> Bool {
     targets.contains { write($0) }
 }
+
+/// One entry of a Finder favorites list, as far as the repair can see it.
+struct FinderFavoriteCandidate: Equatable, Sendable {
+    /// Resolved path, or nil when Finder cannot resolve the entry right now.
+    let resolvedPath: String?
+}
+
+/// What the repairer should do with the entries that point at one mount.
+enum FinderFavoritePlan: Equatable, Sendable {
+    /// Keep the entry at the given candidate index and drop the others.
+    case collapseDuplicates(keep: Int, drop: [Int])
+    /// No entry points at the mount, so insert one.
+    case insertNew
+}
+
+/// Decides which entries of a favorites list belong to one mount.
+///
+/// The repair used to stop at the first entry whose resolved path matched, so
+/// any further duplicate stayed in the list and kept being shown next to the
+/// mount. Only entries whose resolved path equals the mount point are ever
+/// removed, so an entry that Finder cannot resolve right now is never touched.
+func finderFavoritePlan(
+    candidates: [FinderFavoriteCandidate],
+    mountPath: String
+) -> FinderFavoritePlan {
+    let matches = candidates.indices.filter { candidates[$0].resolvedPath == mountPath }
+
+    guard let keep = matches.first else {
+        return .insertNew
+    }
+    return .collapseDuplicates(keep: keep, drop: Array(matches.dropFirst()))
+}
