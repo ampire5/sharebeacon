@@ -52,8 +52,9 @@ struct MenuPanelView: View {
         }
         .frame(width: 380)
         .onAppear {
-            manager.refreshStatus()
+            // Sampling first, so the refresh sees an open panel and measures latency.
             manager.startTrafficSampling()
+            manager.refreshStatus()
         }
         .onDisappear {
             manager.stopTrafficSampling()

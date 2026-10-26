@@ -504,6 +504,16 @@ struct NetworkLinkTests {
     func loopbackResolvesToLoopback() {
         #expect(SystemNetworkLinkResolver().link(toHost: "127.0.0.1")?.interfaceName == "lo0")
     }
+
+    @Test("a snapshot answers repeated questions the same way as the live resolver")
+    func snapshotMatchesLiveResolver() {
+        let live = SystemNetworkLinkResolver()
+        let snapshot = live.snapshot()
+        #expect(snapshot.link(toHost: "127.0.0.1") == live.link(toHost: "127.0.0.1"))
+        #expect(snapshot.link(toHost: "127.0.0.1") == snapshot.link(toHost: "127.0.0.1"))
+        #expect(snapshot.link(forInterface: "lo0") == live.link(forInterface: "lo0"))
+        #expect(snapshot.link(forInterface: "no-such-interface") == nil)
+    }
 }
 
 @Suite("Share status")

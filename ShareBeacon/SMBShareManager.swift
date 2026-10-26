@@ -73,6 +73,9 @@ final class SMBShareManager: NSObject {
     private let saveKey = "shareBeaconShares"
     private let favoriteKey = "shareBeaconRestoresFavorites"
     private let retryInterval: TimeInterval = 60
+    /// How often the retry loop also checks links and free space while the
+    /// menu panel is closed. Network changes and wake still check at once.
+    private let backgroundStatusInterval: Duration = .seconds(300)
     private let reachabilityTimeout: TimeInterval = 120
     private let wakeGraceInterval: TimeInterval = 5
 
@@ -86,6 +89,7 @@ final class SMBShareManager: NSObject {
     @ObservationIgnored private let operationRunner = MountOperationRunner()
     @ObservationIgnored private var statusTask: Task<Void, Never>?
     @ObservationIgnored private var statusRefreshPending = false
+    @ObservationIgnored private var lastStatusRefresh: ContinuousClock.Instant?
     @ObservationIgnored private var unresponsiveStreaks: [UUID: Int] = [:]
     @ObservationIgnored private var trafficTask: Task<Void, Never>?
     @ObservationIgnored private var trafficSamplers = 0
@@ -250,10 +254,26 @@ final class SMBShareManager: NSObject {
         appendLog("Deleted shared credential for \(credential.username)@\(credential.host).")
     }
 
-    func mountAutoMountingShares() {
+    func mountAutoMountingShares(refreshingStatus: Bool = true) {
         refreshMountStates()
         for share in sharesWaitingForAutoMount {
             mount(share)
+        }
+        if refreshingStatus {
+            refreshStatus()
+        }
+    }
+
+    /// Whether the menu panel is open and shows live figures.
+    private var isPanelOpen: Bool { trafficSamplers > 0 }
+
+    /// The retry loop's status check: every round while the panel is open,
+    /// otherwise only once `backgroundStatusInterval` has passed.
+    private func refreshStatusIfDue() {
+        if !isPanelOpen,
+           let lastStatusRefresh,
+           ContinuousClock.now - lastStatusRefresh < backgroundStatusInterval {
+            return
         }
         refreshStatus()
     }
@@ -270,11 +290,15 @@ final class SMBShareManager: NSObject {
         let targets = shares
             .filter { state(for: $0) == .mounted }
             .map { (id: $0.id, host: $0.host, path: mountPath(for: $0)) }
-        let hosts = Set(targets.map { Self.hostKey($0.host) })
+        // Latency only appears in the open panel, so a closed one skips the
+        // TCP connects and keeps the last figures.
+        let hosts = isPanelOpen ? Set(targets.map { Self.hostKey($0.host) }) : []
         let resolver = linkResolver
         let checker = endpointChecker
+        lastStatusRefresh = .now
         statusTask = Task { [weak self] in
             let report = await Task.detached {
+                let resolver = resolver.snapshot()
                 let sessions = SMBSessionReader.read()
                 let byPath = Dictionary(
                     sessions.map { (URL(fileURLWithPath: $0.mountPath).standardizedFileURL.path, $0) },
@@ -302,7 +326,7 @@ final class SMBShareManager: NSObject {
 
             guard let self else { return }
             statusTask = nil
-            apply(report, latencies: latencies)
+            apply(report, latencies: latencies, measuredLatency: !hosts.isEmpty)
             if statusRefreshPending {
                 statusRefreshPending = false
                 refreshStatus()
@@ -312,7 +336,8 @@ final class SMBShareManager: NSObject {
 
     private func apply(
         _ report: [UUID: (link: NetworkLink?, preferred: NetworkLink?, probe: VolumeProbe)],
-        latencies: [String: Duration]
+        latencies: [String: Duration],
+        measuredLatency: Bool
     ) {
         var stale: [ShareConfiguration] = []
         for share in shares {
@@ -326,15 +351,23 @@ final class SMBShareManager: NSObject {
                 }
             }
             let couldMove = canMoveToCable(share)
-            links[share.id] = entry.link
-            preferredLinks[share.id] = entry.preferred
+            // Writing an unchanged value still invalidates the views that read
+            // it, and the menu panel stays alive while it is closed.
+            if links[share.id] != entry.link {
+                links[share.id] = entry.link
+            }
+            if preferredLinks[share.id] != entry.preferred {
+                preferredLinks[share.id] = entry.preferred
+            }
             if !couldMove && canMoveToCable(share) {
                 appendLog("A cable reaches \(share.host), but \(share.name) still runs over \(entry.link?.label ?? "another link"); remount to move it.")
             }
 
             switch entry.probe {
             case .usage(let usage):
-                usages[share.id] = usage
+                if usages[share.id] != usage {
+                    usages[share.id] = usage
+                }
                 if unresponsive.remove(share.id) != nil {
                     appendLog("\(share.name) is responding again.")
                 }
@@ -349,10 +382,14 @@ final class SMBShareManager: NSObject {
                     stale.append(share)
                 }
             case .unavailable:
-                usages[share.id] = nil
+                if usages[share.id] != nil {
+                    usages[share.id] = nil
+                }
             }
         }
-        self.latencies = latencies
+        if measuredLatency, self.latencies != latencies {
+            self.latencies = latencies
+        }
         for share in stale {
             appendLog("\(share.name) stopped responding; remounting.", level: .warning)
             remount(share)
@@ -642,13 +679,18 @@ final class SMBShareManager: NSObject {
             if let existingPoint = table.mountPoint(host: share.host, share: share.shareName) {
                 adoptedMountPoints[share.id] =
                     existingPoint == share.normalizedMountPoint ? nil : existingPoint
-                states[share.id] = .mounted
+                if states[share.id] != .mounted {
+                    states[share.id] = .mounted
+                }
             } else if operations[share.id] == nil {
                 adoptedMountPoints[share.id] = nil
                 if case .failed = states[share.id] {
                     continue
                 }
-                states[share.id] = share.isEnabled ? .unmounted : .disabled
+                let idle: ShareRuntimeState = share.isEnabled ? .unmounted : .disabled
+                if states[share.id] != idle {
+                    states[share.id] = idle
+                }
             }
         }
     }
@@ -727,10 +769,12 @@ final class SMBShareManager: NSObject {
         let retryInterval = self.retryInterval
         retryTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(retryInterval))
+                // The tolerance lets the system wake for this together with other timers.
+                try? await Task.sleep(for: .seconds(retryInterval), tolerance: .seconds(10))
                 guard !Task.isCancelled else { return }
                 guard let self, !self.isSleeping else { continue }
-                self.mountAutoMountingShares()
+                self.mountAutoMountingShares(refreshingStatus: false)
+                self.refreshStatusIfDue()
             }
         }
     }
