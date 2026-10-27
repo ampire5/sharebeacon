@@ -553,6 +553,21 @@ struct ShareStatusTests {
         #expect(sessions[1].activeChannel == .init(clientInterface: nil, serverAddress: "192.168.2.49", isActive: true))
     }
 
+    @Test("an inactive main channel yields to the active alternate one")
+    func inactiveMainChannelIsSkipped() throws {
+        let output = """
+        Session: /Users/tester/Volumes/F$
+        Info: Setup Time: 2026-10-27 02:05:25, Multichannel ON: yes, Reconnect Count: 0
+               id         client IF             server IF   state                     server ip                 port   speed
+        ========================================================================================================================
+        M     229  en0    (wifi    )   14            18          [session inactive     ]   fdfd:bef5:e359:0000:856c:3fc0:e956:7cef  445    349.4 Mb
+        ALT   234  en8    (Ethernet)   19             8 (RSS_3)  [session active       ]   192.168.1.105             445    2.5 Gb
+        """
+        let session = try #require(SMBSession.parse(output).first)
+        #expect(session.channels.map(\.isActive) == [false, true])
+        #expect(session.activeChannel?.clientInterface == "en8")
+    }
+
     @Test("byte counts and rates are short")
     func bytesAreShort() {
         #expect(ByteFormatting.short(3_200_000_000_000) == "3.2T")

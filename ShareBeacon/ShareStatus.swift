@@ -87,7 +87,7 @@ struct SMBSession: Equatable, Sendable {
         return Channel(
             clientInterface: client == "N/A" ? nil : client,
             serverAddress: String(address),
-            isActive: state.hasSuffix("active")
+            isActive: state.split(separator: " ").last == "active"
         )
     }
 }
