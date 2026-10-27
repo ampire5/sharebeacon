@@ -69,8 +69,8 @@ struct SMBSession: Equatable, Sendable {
     }
 
     /// A channel row looks like
-    /// `M 184  en8 (Ethernet) 19   8 (RSS_0) [session active ]  192.168.1.105  445  2.5 Gb`
-    /// or, without multichannel, `M 140  N/A  N/A [session active ]  192.168.2.49  445  N/A`.
+    /// `M 184  en8 (Ethernet) 19   8 (RSS_0) [session active ]  192.0.2.10  445  2.5 Gb`
+    /// or, without multichannel, `M 140  N/A  N/A [session active ]  192.0.2.11  445  N/A`.
     private static func channel(from line: String) -> Channel? {
         guard let open = line.firstIndex(of: "["),
               let close = line[open...].firstIndex(of: "]")
@@ -87,7 +87,7 @@ struct SMBSession: Equatable, Sendable {
         return Channel(
             clientInterface: client == "N/A" ? nil : client,
             serverAddress: String(address),
-            isActive: state.hasSuffix("active")
+            isActive: state.split(separator: " ").last == "active"
         )
     }
 }

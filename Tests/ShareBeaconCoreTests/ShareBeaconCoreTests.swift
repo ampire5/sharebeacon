@@ -25,12 +25,12 @@ struct ShareBeaconCoreTests {
     @Test("mount table matches decoded mount point and share")
     func mountTableMatchesDecodedMountPointAndShare() {
         let output = """
-        //ubani@nas.taila7f773.ts.net/data on /Users/tester/Volumes/data (smbfs, nodev, nosuid, mounted by tester)
+        //tester@files.example.test/data on /Users/tester/Volumes/data (smbfs, nodev, nosuid, mounted by tester)
         """
         let table = MountTable(output: output)
 
         #expect(table.isMounted(
-            host: "nas.taila7f773.ts.net",
+            host: "files.example.test",
             share: "data",
             at: "/Users/tester/Volumes/data"
         ))
@@ -64,19 +64,19 @@ struct ShareBeaconCoreTests {
     @Test("mount table finds a share mounted under a different host form")
     func mountTableFindsShareMountedUnderDifferentHostForm() {
         let output = """
-        //mjoe@192.168.8.11/docs on /Volumes/docs (smbfs, nodev, nosuid, mounted by mjoe)
+        //tester@192.0.2.12/docs on /Volumes/docs (smbfs, nodev, nosuid, mounted by tester)
         """
         let table = MountTable(output: output)
 
         #expect(table.mountPoint(forShareNamed: "docs") == "/Volumes/docs")
         #expect(table.mountPoint(forShareNamed: "missing") == nil)
-        #expect(table.mountPoint(host: "192.168.8.11", share: "docs") == "/Volumes/docs")
+        #expect(table.mountPoint(host: "192.0.2.12", share: "docs") == "/Volumes/docs")
     }
 
     @Test("mount table matches a host against its resolved address")
     func mountTableMatchesHostAgainstResolvedAddress() {
         let output = """
-        //mjoe@127.0.0.1/docs on /Volumes/docs (smbfs, nodev, nosuid, mounted by mjoe)
+        //tester@127.0.0.1/docs on /Volumes/docs (smbfs, nodev, nosuid, mounted by tester)
         """
         let table = MountTable(output: output)
 
@@ -86,7 +86,7 @@ struct ShareBeaconCoreTests {
     @Test("mount table matches repeated lookups for the same host")
     func mountTableMatchesRepeatedLookupsForSameHost() {
         let output = """
-        //mjoe@nas.example.test/data on /Volumes/data (smbfs, nodev, nosuid, mounted by mjoe)
+        //tester@nas.example.test/data on /Volumes/data (smbfs, nodev, nosuid, mounted by tester)
         """
         let table = MountTable(output: output)
 
@@ -177,11 +177,11 @@ struct ShareBeaconCoreTests {
             username: "other",
             mountPoint: "/Volumes/data",
             isEnabled: true,
-            sharedCredential: SharedCredential(host: "NAS.EXAMPLE.TEST", username: "ubani")
+            sharedCredential: SharedCredential(host: "NAS.EXAMPLE.TEST", username: "tester")
         )
 
-        #expect(share.credentialAccount == "shared:nas.example.test\u{1f}ubani")
-        #expect(share.effectiveUsername == "ubani")
+        #expect(share.credentialAccount == "shared:nas.example.test\u{1f}tester")
+        #expect(share.effectiveUsername == "tester")
     }
 
     @Test("configuration without newer fields decodes with defaults")
@@ -271,10 +271,10 @@ struct ShareBeaconCoreTests {
             name: "NAS",
             host: "nas.example.test",
             shareName: "data",
-            username: "ubani",
+            username: "tester",
             mountPoint: "/Volumes/data",
             isEnabled: true,
-            sharedCredential: SharedCredential(host: "nas.example.test", username: "ubani")
+            sharedCredential: SharedCredential(host: "nas.example.test", username: "tester")
         )
 
         let data = try JSONEncoder().encode(share)
@@ -532,26 +532,26 @@ struct NetworkLinkTests {
 @Suite("Share status")
 struct ShareStatusTests {
     static let multichannelOutput = """
-    Session: /Users/tester/Volumes/S$
+    Session: /Users/tester/Volumes/ExampleData1
     Info: Setup Time: 2026-10-19 17:16:22, Multichannel ON: yes, Reconnect Count: 0
     \tTotal RX Bytes: 68954026475 (Packets: 11085429)
     \tTotal TX Bytes: 102567504225 (Packets: 10992981)
            id         client IF             server IF   state                     server ip                 port   speed
     ========================================================================================================================
-    M     184  en8    (Ethernet)   19             8 (RSS_0)  [session active       ]   192.168.1.105             445    2.5 Gb
+    M     184  en8    (Ethernet)   19             8 (RSS_0)  [session active       ]   192.0.2.10             445    2.5 Gb
     Server NIC:
     \tname: NA, idx: 8, type:    NA, speed 2.5 Gb, state connected
-    \t\tip_addr: 192.168.1.105
+    \t\tip_addr: 192.0.2.10
     Client NIC:
     \tname: en8, idx: 19, type: wired, speed 2.5 Gb, state connected
 
-    Session: /Users/tester/Volumes/18TB-WD-1
+    Session: /Users/tester/Volumes/ExampleData2
     Info: Setup Time: 2026-10-19 17:16:24, Multichannel ON: no, Reconnect Count: 0
     \tTotal RX Bytes: 2209343886 (Packets: 3992981)
     \tTotal TX Bytes: 2140570790 (Packets: 3992968)
            id         client IF             server IF   state                     server ip                 port   speed
     ========================================================================================================================
-    M     140     N/A                          N/A      [session active       ]   192.168.2.49              445    N/A
+    M     140     N/A                          N/A      [session active       ]   192.0.2.11              445    N/A
     """
 
     @Test("smbutil multichannel output yields sessions, counters and channels")
@@ -559,11 +559,26 @@ struct ShareStatusTests {
         let sessions = SMBSession.parse(Self.multichannelOutput)
         #expect(sessions.count == 2)
         let windows = try #require(sessions.first)
-        #expect(windows.mountPath == "/Users/tester/Volumes/S$")
+        #expect(windows.mountPath == "/Users/tester/Volumes/ExampleData1")
         #expect(windows.receivedBytes == 68_954_026_475)
         #expect(windows.sentBytes == 102_567_504_225)
-        #expect(windows.activeChannel == .init(clientInterface: "en8", serverAddress: "192.168.1.105", isActive: true))
-        #expect(sessions[1].activeChannel == .init(clientInterface: nil, serverAddress: "192.168.2.49", isActive: true))
+        #expect(windows.activeChannel == .init(clientInterface: "en8", serverAddress: "192.0.2.10", isActive: true))
+        #expect(sessions[1].activeChannel == .init(clientInterface: nil, serverAddress: "192.0.2.11", isActive: true))
+    }
+
+    @Test("an inactive main channel yields to the active alternate one")
+    func inactiveMainChannelIsSkipped() throws {
+        let output = """
+        Session: /Users/tester/Volumes/ExampleData3
+        Info: Setup Time: 2026-10-27 02:05:25, Multichannel ON: yes, Reconnect Count: 0
+               id         client IF             server IF   state                     server ip                 port   speed
+        ========================================================================================================================
+        M     229  en0    (wifi    )   14            18          [session inactive     ]   2001:db8::20  445    349.4 Mb
+        ALT   234  en8    (Ethernet)   19             8 (RSS_3)  [session active       ]   192.0.2.10             445    2.5 Gb
+        """
+        let session = try #require(SMBSession.parse(output).first)
+        #expect(session.channels.map(\.isActive) == [false, true])
+        #expect(session.activeChannel?.clientInterface == "en8")
     }
 
     @Test("byte counts and rates are short")
