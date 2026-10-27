@@ -371,15 +371,7 @@ private struct ShareMenuRow: View {
             if isHovered {
                 actions
             } else if canMoveToCable {
-                Button {
-                    manager.remount(share)
-                } label: {
-                    Label("Cable", systemImage: "cable.connector")
-                        .font(.callout.weight(.semibold))
-                }
-                .buttonStyle(.glass)
-                .controlSize(.mini)
-                .help("A cable reaches this host; remount to move the share onto it")
+                cableButton
             } else if offCable, let link = manager.link(for: share) {
                 LinkBadge(link: link)
             } else if let usage = manager.usage(for: share) {
@@ -460,12 +452,29 @@ private struct ShareMenuRow: View {
         }
     }
 
+    private var cableButton: some View {
+        Button {
+            manager.remount(share)
+        } label: {
+            Label("Cable", systemImage: "cable.connector")
+                .font(.callout.weight(.semibold))
+        }
+        .buttonStyle(.glass)
+        .controlSize(.mini)
+        .help("A cable reaches this host; remount to move the share onto it")
+    }
+
     @ViewBuilder
     private var actions: some View {
         HStack(spacing: 2) {
             if isMounted {
                 RowIconButton(symbol: "folder", help: "Open in Finder") { manager.openInFinder(share) }
-                RowIconButton(symbol: "arrow.clockwise", help: "Remount") { manager.remount(share) }
+                if canMoveToCable {
+                    // Keep the button the row showed before the pointer arrived.
+                    cableButton
+                } else {
+                    RowIconButton(symbol: "arrow.clockwise", help: "Remount") { manager.remount(share) }
+                }
                 RowIconButton(symbol: "eject", help: "Unmount") { manager.unmount(share) }
             } else if share.isEnabled {
                 RowIconButton(symbol: "arrow.up.circle", help: "Mount now") {
