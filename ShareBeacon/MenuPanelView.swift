@@ -265,14 +265,18 @@ private struct HostHeader: View {
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                     Text("\(mounted)/\(total)")
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(.tertiary)
-                    Spacer(minLength: 4)
+                        .fixedSize()
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // The host and count come first; traffic gives way when the row is short.
+            .layoutPriority(1)
+            Spacer(minLength: 4)
 
             if isHovered {
                 RowIconButton(symbol: "arrow.up.circle", help: "Mount all shares on \(host)", action: mountAll)
@@ -281,25 +285,32 @@ private struct HostHeader: View {
                     .disabled(mounted == 0)
             } else {
                 if let label = traffic?.label {
-                    Text(label)
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    ViewThatFits(in: .horizontal) {
+                        Text(label)
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                        Color.clear.frame(width: 0, height: 0)
+                    }
                 }
                 if let latency {
                     Text(Self.milliseconds(latency))
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(.tertiary)
+                        .fixedSize()
                         .help("Time to open a connection to \(host):445")
                 }
             }
             if let link {
                 LinkBadge(link: link)
+                    .fixedSize()
             }
         }
         .padding(.horizontal, 6)
         .padding(.top, 8)
         .padding(.bottom, 3)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: toggle)
         .onHover { isHovered = $0 }
         .animation(.snappy(duration: 0.15), value: collapsed)
     }
