@@ -278,6 +278,7 @@ final class SMBShareManager: NSObject {
         let resolver = linkResolver
         statusTask = Task { [weak self] in
             let report = await Task.detached {
+                let resolver = resolver.snapshot()
                 let sessions = SMBSessionReader.read()
                 let byPath = Dictionary(
                     sessions.map { (URL(fileURLWithPath: $0.mountPath).standardizedFileURL.path, $0) },
@@ -320,15 +321,23 @@ final class SMBShareManager: NSObject {
                 }
             }
             let couldMove = canMoveToCable(share)
-            links[share.id] = entry.link
-            preferredLinks[share.id] = entry.preferred
+            // Writing an unchanged value still invalidates the views that read
+            // it, and the menu panel stays alive while it is closed.
+            if links[share.id] != entry.link {
+                links[share.id] = entry.link
+            }
+            if preferredLinks[share.id] != entry.preferred {
+                preferredLinks[share.id] = entry.preferred
+            }
             if !couldMove && canMoveToCable(share) {
                 appendLog("A cable reaches \(share.host), but \(share.name) still runs over \(entry.link?.label ?? "another link"); remount to move it.")
             }
 
             switch entry.probe {
             case .usage(let usage):
-                usages[share.id] = usage
+                if usages[share.id] != usage {
+                    usages[share.id] = usage
+                }
                 let change = health.record(
                     entry.probe,
                     for: share.id,
@@ -356,7 +365,9 @@ final class SMBShareManager: NSObject {
                     stale.append(share)
                 }
             case .unavailable:
-                usages[share.id] = nil
+                if usages[share.id] != nil {
+                    usages[share.id] = nil
+                }
             }
         }
         for share in stale {
@@ -734,13 +745,18 @@ final class SMBShareManager: NSObject {
             if let existingPoint = table.mountPoint(host: share.host, share: share.shareName) {
                 adoptedMountPoints[share.id] =
                     existingPoint == share.normalizedMountPoint ? nil : existingPoint
-                states[share.id] = .mounted
+                if states[share.id] != .mounted {
+                    states[share.id] = .mounted
+                }
             } else if operations[share.id] == nil {
                 adoptedMountPoints[share.id] = nil
                 if case .failed = states[share.id] {
                     continue
                 }
-                states[share.id] = share.isEnabled ? .unmounted : .disabled
+                let idle: ShareRuntimeState = share.isEnabled ? .unmounted : .disabled
+                if states[share.id] != idle {
+                    states[share.id] = idle
+                }
             }
         }
     }
@@ -819,7 +835,8 @@ final class SMBShareManager: NSObject {
         let retryInterval = self.retryInterval
         retryTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(retryInterval))
+                // The tolerance lets the system wake for this together with other timers.
+                try? await Task.sleep(for: .seconds(retryInterval), tolerance: .seconds(10))
                 guard !Task.isCancelled else { return }
                 guard let self, !self.isSleeping else { continue }
                 self.mountAutoMountingShares()

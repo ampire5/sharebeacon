@@ -1,6 +1,7 @@
 import CoreWLAN
 import Darwin
 import Foundation
+import Synchronization
 import SystemConfiguration
 
 /// The kind of interface the route to a share's host leaves the Mac through.
@@ -96,6 +97,13 @@ enum LinkExpectation: String, Codable, CaseIterable, Sendable {
 protocol NetworkLinkResolving: Sendable {
     func link(toHost host: String) -> NetworkLink?
     func link(forInterface name: String) -> NetworkLink?
+    /// A resolver that reads the interfaces once and answers every later
+    /// question from that reading, for a status refresh that asks per share.
+    func snapshot() -> NetworkLinkResolving
+}
+
+extension NetworkLinkResolving {
+    func snapshot() -> NetworkLinkResolving { self }
 }
 
 /// Asks the routing table which interface reaches a host.
@@ -104,31 +112,15 @@ protocol NetworkLinkResolving: Sendable {
 /// and a source address, which then names the interface SMB uses as well.
 struct SystemNetworkLinkResolver: NetworkLinkResolving {
     func link(toHost host: String) -> NetworkLink? {
-        guard let localAddress = Self.sourceAddress(toHost: host),
-              let interface = Self.interface(owning: localAddress)
-        else { return nil }
-        return Self.link(interfaceName: interface.name, baudRate: interface.bitsPerSecond)
+        NetworkSnapshot.capture().link(toHost: host)
     }
 
     func link(forInterface name: String) -> NetworkLink? {
-        guard let speed = Self.linkSpeeds()[name] else { return nil }
-        return Self.link(interfaceName: name, baudRate: speed)
+        NetworkSnapshot.capture().link(forInterface: name)
     }
 
-    private static func link(interfaceName: String, baudRate: UInt64) -> NetworkLink {
-        let kind = NetworkLink.kind(
-            interfaceName: interfaceName,
-            systemType: systemInterfaceTypes()[interfaceName]
-        )
-        let bitsPerSecond: UInt64
-        if kind == .wifi {
-            // Wi-Fi reports no fixed baud rate, so the current transmit rate stands in.
-            bitsPerSecond = wifiTransmitRate(interfaceName: interfaceName)
-        } else {
-            bitsPerSecond = mediaSpeed(interfaceName: interfaceName)
-                ?? usableBaudRate(baudRate)
-        }
-        return NetworkLink(interfaceName: interfaceName, kind: kind, bitsPerSecond: bitsPerSecond)
+    func snapshot() -> NetworkLinkResolving {
+        NetworkSnapshot.capture()
     }
 
     /// The negotiated speed of an interface.
@@ -136,7 +128,7 @@ struct SystemNetworkLinkResolver: NetworkLinkResolving {
     /// `ifi_baudrate` is 0xFFFFFFFF on an interface whose speed macOS does not
     /// expose, which a 10Gbase-T port does. Dividing that value by a billion
     /// made a 10 Gb link read as "4.3G", so the media word is asked instead.
-    private static func mediaSpeed(interfaceName: String) -> UInt64? {
+    fileprivate static func mediaSpeed(interfaceName: String) -> UInt64? {
         let descriptor = socket(AF_INET, SOCK_DGRAM, 0)
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
@@ -188,7 +180,7 @@ struct SystemNetworkLinkResolver: NetworkLinkResolving {
         return megabits * 1_000_000
     }
 
-    private static func sourceAddress(toHost host: String) -> Data? {
+    fileprivate static func sourceAddress(toHost host: String) -> Data? {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_DGRAM
@@ -236,13 +228,14 @@ struct SystemNetworkLinkResolver: NetworkLinkResolving {
         }
     }
 
-    private static func interface(owning address: Data) -> (name: String, bitsPerSecond: UInt64)? {
+    /// Baud rates by interface, and the interface that owns each local address.
+    fileprivate static func interfaceAddresses() -> (speeds: [String: UInt64], owners: [Data: String]) {
         var list: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&list) == 0, let list else { return nil }
+        guard getifaddrs(&list) == 0, let list else { return ([:], [:]) }
         defer { freeifaddrs(list) }
 
-        var owner: String?
         var speeds: [String: UInt64] = [:]
+        var owners: [Data: String] = [:]
         var cursor: UnsafeMutablePointer<ifaddrs>? = list
         while let current = cursor {
             cursor = current.pointee.ifa_next
@@ -252,44 +245,25 @@ struct SystemNetworkLinkResolver: NetworkLinkResolving {
             if family == AF_LINK, let data = current.pointee.ifa_data {
                 let linkData = data.assumingMemoryBound(to: if_data.self).pointee
                 speeds[name] = UInt64(linkData.ifi_baudrate)
-            } else if owner == nil, family == AF_INET || family == AF_INET6 {
+            } else if family == AF_INET || family == AF_INET6 {
                 var storage = sockaddr_storage()
                 memcpy(&storage, socketAddress, Int(socketAddress.pointee.sa_len))
-                if addressBytes(&storage) == address {
-                    owner = name
+                if let bytes = addressBytes(&storage), owners[bytes] == nil {
+                    owners[bytes] = name
                 }
             }
         }
-        guard let owner else { return nil }
-        return (owner, speeds[owner] ?? 0)
+        return (speeds, owners)
     }
 
-    private static func linkSpeeds() -> [String: UInt64] {
-        var list: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&list) == 0, let list else { return [:] }
-        defer { freeifaddrs(list) }
-        var speeds: [String: UInt64] = [:]
-        var cursor: UnsafeMutablePointer<ifaddrs>? = list
-        while let current = cursor {
-            cursor = current.pointee.ifa_next
-            guard let address = current.pointee.ifa_addr,
-                  Int32(address.pointee.sa_family) == AF_LINK,
-                  let data = current.pointee.ifa_data
-            else { continue }
-            speeds[String(cString: current.pointee.ifa_name)] =
-                UInt64(data.assumingMemoryBound(to: if_data.self).pointee.ifi_baudrate)
-        }
-        return speeds
-    }
-
-    private static func wifiTransmitRate(interfaceName: String) -> UInt64 {
+    fileprivate static func wifiTransmitRate(interfaceName: String) -> UInt64 {
         guard let megabits = CWWiFiClient.shared().interface(withName: interfaceName)?.transmitRate(),
               megabits > 0
         else { return 0 }
         return UInt64(megabits * 1_000_000)
     }
 
-    private static func systemInterfaceTypes() -> [String: String] {
+    fileprivate static func systemInterfaceTypes() -> [String: String] {
         guard let interfaces = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else { return [:] }
         var types: [String: String] = [:]
         for interface in interfaces {
@@ -299,5 +273,75 @@ struct SystemNetworkLinkResolver: NetworkLinkResolving {
             types[name] = type
         }
         return types
+    }
+}
+
+/// The interfaces as they were at one moment. Listing the System Configuration
+/// interfaces walks the I/O Registry, and the Wi-Fi rate and the media word are
+/// calls into other processes or the kernel, so a refresh reads each once
+/// instead of once per share.
+final class NetworkSnapshot: NetworkLinkResolving {
+    private typealias System = SystemNetworkLinkResolver
+
+    private let systemTypes: [String: String]
+    private let baudRates: [String: UInt64]
+    /// The interface that owns each local address.
+    private let owners: [Data: String]
+    private let speeds = Mutex<[String: UInt64]>([:])
+    private let hostLinks = Mutex<[String: NetworkLink?]>([:])
+
+    private init(systemTypes: [String: String], baudRates: [String: UInt64], owners: [Data: String]) {
+        self.systemTypes = systemTypes
+        self.baudRates = baudRates
+        self.owners = owners
+    }
+
+    static func capture() -> NetworkSnapshot {
+        let (baudRates, owners) = System.interfaceAddresses()
+        return NetworkSnapshot(systemTypes: System.systemInterfaceTypes(), baudRates: baudRates, owners: owners)
+    }
+
+    func link(toHost host: String) -> NetworkLink? {
+        let key = host.lowercased()
+        if let known = hostLinks.withLock({ $0[key] }) {
+            return known
+        }
+        let link = System.sourceAddress(toHost: host)
+            .flatMap { owners[$0] }
+            .map { link(interfaceName: $0) }
+        hostLinks.withLock { $0[key] = link }
+        return link
+    }
+
+    func link(forInterface name: String) -> NetworkLink? {
+        guard baudRates[name] != nil else { return nil }
+        return link(interfaceName: name)
+    }
+
+    func snapshot() -> NetworkLinkResolving { self }
+
+    private func link(interfaceName: String) -> NetworkLink {
+        let kind = NetworkLink.kind(interfaceName: interfaceName, systemType: systemTypes[interfaceName])
+        return NetworkLink(
+            interfaceName: interfaceName,
+            kind: kind,
+            bitsPerSecond: speed(interfaceName: interfaceName, kind: kind)
+        )
+    }
+
+    private func speed(interfaceName: String, kind: NetworkLinkKind) -> UInt64 {
+        if let known = speeds.withLock({ $0[interfaceName] }) {
+            return known
+        }
+        let speed: UInt64
+        if kind == .wifi {
+            // Wi-Fi reports no fixed baud rate, so the current transmit rate stands in.
+            speed = System.wifiTransmitRate(interfaceName: interfaceName)
+        } else {
+            speed = System.mediaSpeed(interfaceName: interfaceName)
+                ?? System.usableBaudRate(baudRates[interfaceName] ?? 0)
+        }
+        speeds.withLock { $0[interfaceName] = speed }
+        return speed
     }
 }
