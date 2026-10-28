@@ -11,7 +11,7 @@ reconnects.
 - Multiple independently configured SMB shares
 - Per-share automatic reconnect or on-demand mounting
 - Shared Keychain credentials reused across shares
-- Serialized mount operations and endpoint readiness checks
+- Mount operations serialized per server, and endpoint readiness checks
 - Automatic recovery after login, network changes, sleep/wake, and disconnects
 - Sleep-aware: pauses all monitoring and mount activity while the Mac sleeps
 - Credentials kept out of URLs, configuration, process arguments, and logs

@@ -82,7 +82,9 @@ final class SMBShareManager: NSObject {
     @ObservationIgnored private var adoptedMountPoints: [UUID: String] = [:]
     @ObservationIgnored private var manuallyUnmounted: Set<UUID> = []
     @ObservationIgnored private var isSleeping = false
-    @ObservationIgnored private let operationRunner = MountOperationRunner()
+    /// One runner per host, keyed by `HostTraffic.hostKey`: a server's mounts still go one at
+    /// a time, but a server that stopped answering no longer holds up the shares of the others.
+    @ObservationIgnored private var operationRunners: [String: MountOperationRunner] = [:]
     @ObservationIgnored private var statusTask: Task<Void, Never>?
     @ObservationIgnored private var statusRefreshPending = false
     @ObservationIgnored private var trafficTask: Task<Void, Never>?
@@ -242,6 +244,16 @@ final class SMBShareManager: NSObject {
         appendLog("Deleted shared credential for \(credential.username)@\(credential.host).")
     }
 
+    private func operationRunner(for host: String) -> MountOperationRunner {
+        let key = HostTraffic.hostKey(host)
+        if let runner = operationRunners[key] {
+            return runner
+        }
+        let runner = MountOperationRunner()
+        operationRunners[key] = runner
+        return runner
+    }
+
     func mountAutoMountingShares() {
         refreshMountStates()
         let now = Date()
@@ -376,7 +388,7 @@ final class SMBShareManager: NSObject {
         operations[share.id] = Task { [weak self] in
             guard let self else { return }
             do {
-                try await operationRunner.unmount(
+                try await operationRunner(for: share.host).unmount(
                     mounter,
                     share: share,
                     at: adoptedMountPoints[share.id] ?? share.normalizedMountPoint,
@@ -622,7 +634,7 @@ final class SMBShareManager: NSObject {
                 guard let password = try credentialStore.password(for: share), !password.isEmpty else {
                     throw ShareBeaconError.credentialMissing
                 }
-                try await operationRunner.mount(mounter, share: share, password: password)
+                try await operationRunner(for: share.host).mount(mounter, share: share, password: password)
                 states[share.id] = .mounted
                 mountRetries.reset(share.id)
                 appendLog("Mounted \(share.name) at \(share.normalizedMountPoint).")
@@ -684,7 +696,7 @@ final class SMBShareManager: NSObject {
             }
 
             do {
-                try await operationRunner.unmount(
+                try await operationRunner(for: share.host).unmount(
                     mounter,
                     share: share,
                     at: adoptedMountPoints[share.id] ?? share.normalizedMountPoint,
