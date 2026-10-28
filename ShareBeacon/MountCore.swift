@@ -665,6 +665,44 @@ private final class EndpointCheckCompletion: @unchecked Sendable {
     }
 }
 
+/// When automatic mounting may try a share again after it failed. A share that
+/// keeps failing, such as one whose disk is dying on the server, is not tried
+/// every minute: each attempt makes the server touch that disk again. The wait
+/// starts at a minute and doubles up to half an hour. A mount the user asks for
+/// is never held back.
+struct MountRetrySchedule: Equatable, Sendable {
+    static let firstDelay: TimeInterval = 60
+    static let longestDelay: TimeInterval = 1_800
+
+    private struct Failure: Equatable, Sendable {
+        var count: Int
+        var retryAt: Date
+    }
+
+    private var failures: [UUID: Failure] = [:]
+
+    static func delay(afterFailures count: Int) -> TimeInterval {
+        guard count > 0 else { return 0 }
+        return min(firstDelay * pow(2, Double(min(count, 16) - 1)), longestDelay)
+    }
+
+    func allowsAutomaticAttempt(for id: UUID, at now: Date) -> Bool {
+        failures[id].map { now >= $0.retryAt } ?? true
+    }
+
+    /// Records a failed mount and returns how long automatic mounting now waits.
+    mutating func recordFailure(for id: UUID, at now: Date) -> TimeInterval {
+        let count = (failures[id]?.count ?? 0) + 1
+        let delay = Self.delay(afterFailures: count)
+        failures[id] = Failure(count: count, retryAt: now.addingTimeInterval(delay))
+        return delay
+    }
+
+    mutating func reset(_ id: UUID) {
+        failures[id] = nil
+    }
+}
+
 protocol ShareMounting: Sendable {
     func mount(_ share: ShareConfiguration, password: String) throws
 

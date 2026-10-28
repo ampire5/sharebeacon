@@ -88,6 +88,7 @@ final class SMBShareManager: NSObject {
     @ObservationIgnored private var trafficTask: Task<Void, Never>?
     @ObservationIgnored private var trafficSamplers = 0
     @ObservationIgnored private var panelRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var mountRetries = MountRetrySchedule()
 
     init(
         credentialStore: CredentialStoring = KeychainCredentialStore.shared,
@@ -177,6 +178,7 @@ final class SMBShareManager: NSObject {
         shares = updated.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         saveShares()
         states[share.id] = share.isEnabled ? .unmounted : .disabled
+        mountRetries.reset(share.id)
         appendLog("Saved configuration for \(share.name).")
 
         let needsReconciliation = existing.map {
@@ -242,7 +244,8 @@ final class SMBShareManager: NSObject {
 
     func mountAutoMountingShares() {
         refreshMountStates()
-        for share in sharesWaitingForAutoMount {
+        let now = Date()
+        for share in sharesWaitingForAutoMount where mountRetries.allowsAutomaticAttempt(for: share.id, at: now) {
             mount(share)
         }
         refreshStatus()
@@ -538,6 +541,9 @@ final class SMBShareManager: NSObject {
 
     func mount(_ share: ShareConfiguration, explicit: Bool = false) {
         manuallyUnmounted.remove(share.id)
+        if explicit {
+            mountRetries.reset(share.id)
+        }
         guard share.isEnabled, operations[share.id] == nil else { return }
 
         let table = MountTable.current()
@@ -618,6 +624,7 @@ final class SMBShareManager: NSObject {
                 }
                 try await operationRunner.mount(mounter, share: share, password: password)
                 states[share.id] = .mounted
+                mountRetries.reset(share.id)
                 appendLog("Mounted \(share.name) at \(share.normalizedMountPoint).")
                 refreshStatus()
                 if restoreFavoriteIfEnabled(for: share, at: nil) {
@@ -628,6 +635,7 @@ final class SMBShareManager: NSObject {
                     let configuredPoint = share.normalizedMountPoint
                     adoptedMountPoints[share.id] = existingPoint == configuredPoint ? nil : existingPoint
                     states[share.id] = .mounted
+                    mountRetries.reset(share.id)
                     appendLog(
                         "\(share.name) is already mounted at \(existingPoint); using the existing mount.",
                         level: .warning
@@ -640,7 +648,12 @@ final class SMBShareManager: NSObject {
                     }
                 } else {
                     states[share.id] = .failed(error.localizedDescription)
-                    appendLog("Failed mounting \(share.name): \(error.localizedDescription)", level: .error)
+                    let delay = mountRetries.recordFailure(for: share.id, at: Date())
+                    appendLog(
+                        "Failed mounting \(share.name): \(error.localizedDescription) "
+                            + "Next automatic attempt in \(Int(delay / 60)) min.",
+                        level: .error
+                    )
                 }
             }
         }

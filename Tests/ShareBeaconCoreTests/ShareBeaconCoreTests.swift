@@ -450,6 +450,32 @@ struct ShareBeaconCoreTests {
     func planInsertsOnEmptyList() {
         #expect(finderFavoritePlan(candidates: [], mountPath: "/Users/tester/Volumes/data") == .insertNew)
     }
+
+    @Test("a share that keeps failing to mount is retried less and less often, up to half an hour")
+    func mountRetryBacksOff() {
+        let delays = (1...8).map { MountRetrySchedule.delay(afterFailures: $0) }
+        #expect(delays == [60, 120, 240, 480, 960, 1_800, 1_800, 1_800])
+        #expect(MountRetrySchedule.delay(afterFailures: 0) == 0)
+        #expect(MountRetrySchedule.delay(afterFailures: 1_000) == 1_800)
+    }
+
+    @Test("automatic mounting waits out the delay and starts over after a reset")
+    func mountRetryScheduleHoldsAutomaticAttempts() {
+        let id = UUID()
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        var schedule = MountRetrySchedule()
+        #expect(schedule.allowsAutomaticAttempt(for: id, at: start))
+
+        #expect(schedule.recordFailure(for: id, at: start) == 60)
+        #expect(!schedule.allowsAutomaticAttempt(for: id, at: start.addingTimeInterval(59)))
+        #expect(schedule.allowsAutomaticAttempt(for: id, at: start.addingTimeInterval(60)))
+        #expect(schedule.allowsAutomaticAttempt(for: UUID(), at: start))
+
+        #expect(schedule.recordFailure(for: id, at: start.addingTimeInterval(60)) == 120)
+        schedule.reset(id)
+        #expect(schedule.allowsAutomaticAttempt(for: id, at: start.addingTimeInterval(61)))
+        #expect(schedule.recordFailure(for: id, at: start.addingTimeInterval(61)) == 60)
+    }
 }
 
 @Suite("Network link")
