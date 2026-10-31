@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import ShareBeaconCore
 
@@ -737,33 +738,140 @@ struct ShareStatusTests {
         #expect(policy.misses(after: .unresponsive, current: 2) == 3)
         let usage = VolumeUsage(totalBytes: 100, freeBytes: 50)
         #expect(policy.misses(after: .usage(usage), current: 2) == 0)
-        #expect(policy.misses(after: .unavailable, current: 2) == 2)
+        #expect(policy.misses(after: .unavailable, current: 2) == 3)
     }
 
-    @Test("three misses repair only a share that mounts itself")
+    @Test("a volume whose statfs keeps failing is repaired")
+    func healthRepairsAfterStatfsFails() {
+        var health = ShareHealth(policy: RepairPolicy(minimumWindow: 0))
+        let id = UUID()
+        let start = Date()
+        var change = health.record(
+            .unavailable, for: id, now: start,
+            isEnabled: true, autoMount: true
+        )
+        #expect(change.becameUnresponsive)
+        #expect(!change.shouldRepair)
+        _ = health.record(
+            .unavailable, for: id, now: start.addingTimeInterval(1),
+            isEnabled: true, autoMount: true
+        )
+        change = health.record(
+            .unavailable, for: id, now: start.addingTimeInterval(2),
+            isEnabled: true, autoMount: true
+        )
+        #expect(change.shouldRepair)
+        #expect(health.missStreak(id) == 3)
+    }
+
+    @Test("session samples are reused within their lifetime")
+    func sessionSamplerReusesFreshSamples() async {
+        let reads = Mutex(0)
+        let sampler = SMBSessionSampler { _ in
+            reads.withLock { $0 += 1 }
+            return []
+        }
+        let first = await sampler.sample(maxAge: .seconds(3), timeout: 1)
+        let second = await sampler.sample(maxAge: .seconds(3), timeout: 1)
+        #expect(first.at == second.at)
+        #expect(reads.withLock { $0 } == 1)
+    }
+
+    @Test("an old session sample is read again")
+    func sessionSamplerReadsAfterExpiry() async {
+        let reads = Mutex(0)
+        let sampler = SMBSessionSampler { _ in
+            reads.withLock { $0 += 1 }
+            return []
+        }
+        _ = await sampler.sample(maxAge: .zero, timeout: 1)
+        _ = await sampler.sample(maxAge: .zero, timeout: 1)
+        #expect(reads.withLock { $0 } == 2)
+    }
+
+    @Test("concurrent session reads share one command")
+    func sessionSamplerCoalescesConcurrentReads() async {
+        let reads = Mutex(0)
+        let sampler = SMBSessionSampler { _ in
+            Thread.sleep(forTimeInterval: 0.05)
+            reads.withLock { $0 += 1 }
+            return []
+        }
+        async let first = sampler.sample(maxAge: .zero, timeout: 1)
+        async let second = sampler.sample(maxAge: .zero, timeout: 1)
+        _ = await (first, second)
+        #expect(reads.withLock { $0 } == 1)
+    }
+
+    @Test("three misses over the window repair only a share that mounts itself")
     func repairNeedsThreeMissesAndAutoMount() {
         let policy = RepairPolicy()
-        #expect(!policy.shouldRepair(misses: 2, isEnabled: true, autoMount: true))
-        #expect(policy.shouldRepair(misses: 3, isEnabled: true, autoMount: true))
-        #expect(policy.shouldRepair(misses: 4, isEnabled: true, autoMount: true))
-        #expect(!policy.shouldRepair(misses: 3, isEnabled: false, autoMount: true))
-        #expect(!policy.shouldRepair(misses: 3, isEnabled: true, autoMount: false))
-        #expect(RepairPolicy(missesBeforeRepair: 1).shouldRepair(misses: 1, isEnabled: true, autoMount: true))
+        let now = Date()
+        let old = now.addingTimeInterval(-300)
+        let recent = now.addingTimeInterval(-30)
+        #expect(!policy.shouldRepair(misses: 2, firstMiss: old, now: now, isEnabled: true, autoMount: true))
+        #expect(policy.shouldRepair(misses: 3, firstMiss: old, now: now, isEnabled: true, autoMount: true))
+        #expect(policy.shouldRepair(misses: 4, firstMiss: old, now: now, isEnabled: true, autoMount: true))
+        #expect(!policy.shouldRepair(misses: 3, firstMiss: old, now: now, isEnabled: false, autoMount: true))
+        #expect(!policy.shouldRepair(misses: 3, firstMiss: old, now: now, isEnabled: true, autoMount: false))
+        #expect(!policy.shouldRepair(misses: 3, firstMiss: nil, now: now, isEnabled: true, autoMount: true))
+        // Three misses within half a minute are a slow share, not a hang.
+        #expect(!policy.shouldRepair(misses: 3, firstMiss: recent, now: now, isEnabled: true, autoMount: true))
+        #expect(RepairPolicy(missesBeforeRepair: 1, minimumWindow: 0).shouldRepair(
+            misses: 1, firstMiss: now, now: now, isEnabled: true, autoMount: true
+        ))
     }
 
-    @Test("a share is marked once and repaired on the third miss")
+    @Test("a share is marked once and repaired on the third miss after the window")
     func healthRepairsOnTheThirdMiss() {
         var health = ShareHealth()
         let id = UUID()
-        var change = health.record(.unresponsive, for: id, isEnabled: true, autoMount: true)
+        let start = Date()
+        var change = health.record(.unresponsive, for: id, now: start, isEnabled: true, autoMount: true)
         #expect(change.becameUnresponsive)
         #expect(!change.shouldRepair)
-        _ = health.record(.unresponsive, for: id, isEnabled: true, autoMount: true)
-        change = health.record(.unresponsive, for: id, isEnabled: true, autoMount: true)
+        _ = health.record(
+            .unresponsive, for: id, now: start.addingTimeInterval(10),
+            isEnabled: true, autoMount: true
+        )
+        change = health.record(
+            .unresponsive, for: id, now: start.addingTimeInterval(120),
+            isEnabled: true, autoMount: true
+        )
         #expect(!change.becameUnresponsive)
         #expect(change.shouldRepair)
         #expect(health.isUnresponsive(id))
         #expect(health.missStreak(id) == 3)
+    }
+
+    @Test("a repair pauses further repairs for the cooldown")
+    func healthHonorsTheRepairCooldown() {
+        var health = ShareHealth()
+        let id = UUID()
+        let start = Date()
+        health.noteRepair(id, now: start, cooldown: health.policy.repairCooldown)
+        #expect(!health.canRepair(id, now: start.addingTimeInterval(599)))
+        #expect(health.canRepair(id, now: start.addingTimeInterval(600)))
+
+        var change = ShareHealthChange()
+        for offset in [0.0, 60, 120, 300] {
+            change = health.record(
+                .unresponsive, for: id, now: start.addingTimeInterval(offset),
+                isEnabled: true, autoMount: true
+            )
+        }
+        #expect(!change.shouldRepair)
+        #expect(health.missStreak(id) == 4)
+        #expect(health.isUnresponsive(id))
+
+        change = health.record(
+            .unresponsive, for: id, now: start.addingTimeInterval(600),
+            isEnabled: true, autoMount: true
+        )
+        #expect(change.shouldRepair)
+
+        health.resetCooldown(id)
+        #expect(health.canRepair(id, now: start))
     }
 
     @Test("a share that mounts by hand is never repaired")
@@ -786,7 +894,6 @@ struct ShareStatusTests {
         let id = UUID()
         _ = health.record(.unresponsive, for: id, isEnabled: true, autoMount: true)
         _ = health.record(.busy, for: id, isEnabled: true, autoMount: true)
-        _ = health.record(.unavailable, for: id, isEnabled: true, autoMount: true)
         _ = health.record(.unresponsive, for: id, isEnabled: true, autoMount: true)
         #expect(health.missStreak(id) == 2)
     }
@@ -822,6 +929,56 @@ struct ShareStatusTests {
         #expect(health.missStreak(id) == 0)
         let again = health.record(.usage(usage), for: id, isEnabled: true, autoMount: true)
         #expect(!again.recovered)
+    }
+
+    @Test("automatic status refreshes keep the minimum interval")
+    func statusRefreshPolicyThrottles() {
+        let policy = StatusRefreshPolicy(minimumInterval: 15)
+        let now = Date()
+        #expect(policy.delay(lastRefresh: now.addingTimeInterval(-16), now: now) == nil)
+        #expect(policy.delay(lastRefresh: now.addingTimeInterval(-15), now: now) == nil)
+        let partial = policy.delay(lastRefresh: now.addingTimeInterval(-8), now: now)
+        #expect(partial != nil && abs(partial! - 7) < 0.001)
+        #expect(policy.delay(lastRefresh: now, now: now) == 15)
+        // A clock that moved backwards must not cause a tight loop.
+        #expect(policy.delay(lastRefresh: now.addingTimeInterval(5), now: now) == 15)
+    }
+
+    @Test("a wake waits for a quiet path before reconnecting")
+    func wakePolicyWaitsForAStablePath() {
+        let policy = WakePolicy()
+        let now = Date()
+        #expect(!policy.isSettled(lastChange: now.addingTimeInterval(-9.9), now: now))
+        #expect(policy.isSettled(lastChange: now.addingTimeInterval(-10.1), now: now))
+        #expect(policy.isSettled(lastChange: now.addingTimeInterval(-30), now: now))
+        #expect(!policy.shouldGiveUp(waited: 39.9))
+        #expect(policy.shouldGiveUp(waited: 40))
+        #expect(policy.grace + policy.stableInterval < policy.maximumWait)
+    }
+
+    @Test("an unreachable endpoint pauses repairs without clearing the streak")
+    func healthPausesRepairsForUnreachableServer() {
+        var health = ShareHealth(policy: RepairPolicy(minimumWindow: 0))
+        let id = UUID()
+        let start = Date()
+        _ = health.record(.unresponsive, for: id, now: start, isEnabled: true, autoMount: true)
+        health.pauseRepairs(id, now: start, for: 60)
+        _ = health.record(
+            .unresponsive, for: id, now: start.addingTimeInterval(30),
+            isEnabled: true, autoMount: true
+        )
+        let paused = health.record(
+            .unresponsive, for: id, now: start.addingTimeInterval(59),
+            isEnabled: true, autoMount: true
+        )
+        #expect(!paused.shouldRepair)
+        #expect(health.isUnresponsive(id))
+        #expect(health.missStreak(id) == 3)
+        let resumed = health.record(
+            .unresponsive, for: id, now: start.addingTimeInterval(60),
+            isEnabled: true, autoMount: true
+        )
+        #expect(resumed.shouldRepair)
     }
 
     @Test("traffic sums the sessions of every share on a host")
