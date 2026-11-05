@@ -14,17 +14,18 @@ let package = Package(
             exclude: [
                 "Assets.xcassets",
                 "Info.plist",
-                "FinderSidebarRepairer.swift",
                 "AppMetadata.swift",
-                "Logger.swift",
                 "Preview Content",
                 "SettingsView.swift",
                 "LogsView.swift",
-                "SMBShareManager.swift",
+                "MenuPanelView.swift",
                 "sharebeacon.entitlements",
                 "ShareBeaconApp.swift"
             ],
-            sources: ["MountCore.swift", "NetworkLink.swift", "ShareStatus.swift", "ReconnectPolicy.swift"]
+            sources: [
+                "MountCore.swift", "NetworkLink.swift", "ShareStatus.swift", "ReconnectPolicy.swift",
+                "SMBShareManager.swift", "FinderSidebarRepairer.swift", "Logger.swift"
+            ]
         ),
         .testTarget(
             name: "ShareBeaconCoreTests",

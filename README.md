@@ -78,6 +78,8 @@ swift test
 ./scripts/build-release.sh
 ```
 
+Core and manager regression tests use injected endpoints and mounters; they do not connect to or change SMB shares.
+
 Use `./scripts/build-release.sh --clean` for a clean derived-data build,
 `--skip-sign` when only an unsigned local artifact is needed, and `--notarize`
 to submit the release to Apple notarization, then staple and validate the
@@ -129,6 +131,8 @@ new reconnection attempts. After the Mac wakes it resumes automatically, waits
 a short network grace period so the connection is ready, and then reconnects
 shares that are configured to mount automatically. ShareBeacon never keeps the
 Mac awake or blocks it from sleeping.
+
+Editing, disabling, or removing a share invalidates its pending connection. A system mount call already in progress may still finish; a late result cannot restore the old configuration. ShareBeacon retires that mount without forcing it, and leaves busy volumes available for manual eject. Mount recovery matches both the server and share name. Removing a share uses its actual adopted mount path without forcing an eject. If an edited connection is busy, ShareBeacon keeps the error visible and retries retirement before connecting with the new settings; it does not silently reuse the old connection.
 
 ## Credits
 

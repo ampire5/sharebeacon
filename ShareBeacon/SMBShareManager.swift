@@ -11,11 +11,30 @@ private typealias ShareStatusEntry = (
 )
 
 private actor MountOperationRunner {
-    func mount(_ mounter: ShareMounting, share: ShareConfiguration, password: String) throws {
+    /// The synchronous NetFS call cannot be interrupted. If it finishes after
+    /// cancellation, retire its exact mount before this host starts newer work.
+    /// Return true when a busy volume had to be left for manual eject.
+    func mount(
+        _ mounter: ShareMounting,
+        share: ShareConfiguration,
+        password: String,
+        mountTable: @Sendable () -> MountTable
+    ) throws -> Bool {
+        try Task.checkCancellation()
         try mounter.mount(share, password: password)
+        guard Task.isCancelled,
+              mountTable().isMounted(host: share.host, share: share.shareName, at: share.normalizedMountPoint)
+        else { return false }
+        do {
+            try mounter.unmount(share, at: share.normalizedMountPoint, forcing: false)
+            return false
+        } catch {
+            return true
+        }
     }
 
-    func unmount(_ mounter: ShareMounting, share: ShareConfiguration, at mountPoint: String, forcing: Bool = true) throws {
+    func unmount(_ mounter: ShareMounting, share: ShareConfiguration, at mountPoint: String, forcing: Bool = true, checkingCancellation: Bool = true) throws {
+        if checkingCancellation { try Task.checkCancellation() }
         try mounter.unmount(share, at: mountPoint, forcing: forcing)
     }
 }
@@ -81,6 +100,9 @@ final class SMBShareManager: NSObject {
     @ObservationIgnored private let linkResolver: NetworkLinkResolving
     @ObservationIgnored private let sessionSampler = SMBSessionSampler()
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let monitoringEnabled: Bool
+    @ObservationIgnored private let mountTable: @Sendable () -> MountTable
+    @ObservationIgnored private let log: (String, LogLevel) -> Void
     private let saveKey = "shareBeaconShares"
     private let favoriteKey = "shareBeaconRestoresFavorites"
     private let retryInterval: TimeInterval = 60
@@ -94,7 +116,15 @@ final class SMBShareManager: NSObject {
     @ObservationIgnored private var networkMonitor: NWPathMonitor?
     @ObservationIgnored private var retryTask: Task<Void, Never>?
     @ObservationIgnored private var wakeTask: Task<Void, Never>?
+    @ObservationIgnored private var operationIDs: [UUID: UUID] = [:]
     @ObservationIgnored private var operations: [UUID: Task<Void, Never>] = [:]
+    private struct BlockedReconciliation {
+        let share: ShareConfiguration
+        let mountPoint: String
+        let message: String
+    }
+    /// An old connection that could not be safely retired must not satisfy a changed configuration.
+    @ObservationIgnored private var blockedReconciliations: [UUID: BlockedReconciliation] = [:]
     @ObservationIgnored private var adoptedMountPoints: [UUID: String] = [:]
     @ObservationIgnored private var manuallyUnmounted: Set<UUID> = []
     /// Mounts started by `repair`. They keep the repair cooldown; a mount the
@@ -120,7 +150,10 @@ final class SMBShareManager: NSObject {
         mounter: ShareMounting = NetFSShareMounter(),
         finderSidebarRepairer: FinderSidebarRepairing = FinderSidebarRepairer(),
         linkResolver: NetworkLinkResolving = SystemNetworkLinkResolver(),
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        mountTable: @escaping @Sendable () -> MountTable = MountTable.current,
+        monitoringEnabled: Bool = true,
+        log: @escaping (String, LogLevel) -> Void = { AppLogger.shared.record($0, level: $1) }
     ) {
         self.credentialStore = credentialStore
         self.endpointChecker = endpointChecker
@@ -128,11 +161,14 @@ final class SMBShareManager: NSObject {
         self.finderSidebarRepairer = finderSidebarRepairer
         self.linkResolver = linkResolver
         self.defaults = defaults
+        self.monitoringEnabled = monitoringEnabled
+        self.mountTable = mountTable
+        self.log = log
         super.init()
         restoresFavoritesByDefault = defaults.object(forKey: favoriteKey) as? Bool ?? true
         loadShares()
         refreshMountStates()
-        startMonitoring()
+        if monitoringEnabled { startMonitoring() }
         appendLog("ShareBeacon started.")
     }
 
@@ -201,41 +237,47 @@ final class SMBShareManager: NSObject {
             try credentialStore.save(password: password, for: share)
         }
 
+        if existing != share || password?.isEmpty == false { invalidateOperation(for: share.id) }
         shares = updated.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         saveShares()
         states[share.id] = share.isEnabled ? .unmounted : .disabled
         mountRetries.reset(share.id)
         appendLog("Saved configuration for \(share.name).")
 
-        let needsReconciliation = existing.map {
+        let previous = blockedReconciliations[share.id]?.share ?? existing
+        let needsReconciliation = blockedReconciliations[share.id] != nil || existing.map {
             $0.mountIdentity != share.mountIdentity ||
+            $0.effectiveUsername != share.effectiveUsername ||
+            $0.credentialAccount != share.credentialAccount ||
             (password?.isEmpty == false) ||
             ($0.isEnabled && !share.isEnabled) ||
             ($0.autoMount && !share.autoMount)
         } ?? false
 
         if needsReconciliation,
-           let existing,
-           MountTable.current().mountPoint(host: existing.host, share: existing.shareName) != nil {
-            unmount(existing, thenMount: share.isEnabled && share.autoMount ? share : nil)
+           let previous,
+           let mountPoint = mountTable().mountPoint(host: previous.host, share: previous.shareName) {
+            unmount(previous, at: mountPoint, thenMount: share.isEnabled && share.autoMount ? share : nil, forcing: false)
         } else if share.isEnabled && share.autoMount {
             mount(share)
         }
     }
 
     func removeShare(_ share: ShareConfiguration, removeCredential: Bool = true) {
-        operations[share.id]?.cancel()
-        operations[share.id] = nil
-        adoptedMountPoints[share.id] = nil
+        invalidateOperation(for: share.id)
+        let previous = blockedReconciliations[share.id]?.share ?? share
+        let mountedAt = mountTable().mountPoint(host: previous.host, share: previous.shareName)
         if removeCredential,
            !shares.contains(where: {
                $0.id != share.id && $0.credentialAccount == share.credentialAccount
            }) {
             try? credentialStore.deletePassword(for: share)
         }
-        if MountTable.current().mountPoint(host: share.host, share: share.shareName) != nil {
-            unmount(share)
+        if let mountedAt {
+            unmount(previous, at: mountedAt, thenMount: nil, forcing: false)
         }
+        adoptedMountPoints[share.id] = nil
+        blockedReconciliations[share.id] = nil
         shares.removeAll { $0.id == share.id }
         states[share.id] = nil
         saveShares()
@@ -324,6 +366,7 @@ final class SMBShareManager: NSObject {
     }
 
     private func startStatusRefresh() {
+        guard monitoringEnabled else { return }
         guard statusTask == nil else {
             scheduleStatusRefresh(after: 0.5)
             return
@@ -467,17 +510,22 @@ final class SMBShareManager: NSObject {
     private func repair(_ share: ShareConfiguration) {
         guard state(for: share) == .mounted, operations[share.id] == nil else { return }
         guard isNetworkAvailable else { return }
+        let operationID = UUID()
+        operationIDs[share.id] = operationID
         operations[share.id] = Task { [weak self] in
             guard let self else { return }
+            defer { finishOperation(for: share.id, operationID: operationID) }
             // An unreachable server cannot be helped by a reconnect. Leaving
             // the share mounted avoids the "connection lost" alert and lets
             // it recover on its own when the link returns.
-            guard await endpointChecker.isReachable(
+            let reachable = await endpointChecker.isReachable(
                 host: share.host,
                 port: 445,
                 timeout: 2
-            ) else {
-                operations[share.id] = nil
+            )
+            guard ownsOperation(for: share.id, operationID: operationID) else { return }
+            guard reachable else {
+                finishOperation(for: share.id, operationID: operationID)
                 health.pauseRepairs(share.id, for: 60)
                 appendLog(
                     "\(share.name) is not responding and \(share.host):445 is unreachable; leaving it mounted.",
@@ -486,7 +534,7 @@ final class SMBShareManager: NSObject {
                 return
             }
             guard isNetworkAvailable else {
-                operations[share.id] = nil
+                finishOperation(for: share.id, operationID: operationID)
                 return
             }
             // The old probe no longer speaks for the share: a fresh session is
@@ -506,8 +554,9 @@ final class SMBShareManager: NSObject {
                     at: adoptedMountPoints[share.id] ?? share.normalizedMountPoint,
                     forcing: false
                 )
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
                 adoptedMountPoints[share.id] = nil
-                operations[share.id] = nil
+                finishOperation(for: share.id, operationID: operationID)
                 appendLog("Unmounted \(share.name) after it stopped responding.", level: .warning)
                 guard let current = shares.first(where: { $0.id == share.id }) else {
                     states[share.id] = nil
@@ -518,7 +567,8 @@ final class SMBShareManager: NSObject {
                 mount(current, explicit: true)
                 repairMounts.remove(share.id)
             } catch {
-                operations[share.id] = nil
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
+                finishOperation(for: share.id, operationID: operationID)
                 states[share.id] = .mounted
                 // A busy volume means a copy is running. Keep the longer
                 // pause and mark the share unresponsive again, so the panel
@@ -681,17 +731,60 @@ final class SMBShareManager: NSObject {
         adoptedMountPoints[share.id] ?? share.normalizedMountPoint
     }
 
+    private func invalidateOperation(for id: UUID) {
+        operations.removeValue(forKey: id)?.cancel()
+        operationIDs[id] = nil
+    }
+
+    private func ownsOperation(for id: UUID, operationID: UUID) -> Bool {
+        !Task.isCancelled && !isSleeping && operationIDs[id] == operationID
+    }
+
+    @discardableResult
+    private func finishOperation(for id: UUID, operationID: UUID) -> Bool {
+        guard operationIDs[id] == operationID else { return false }
+        operations[id] = nil
+        operationIDs[id] = nil
+        return true
+    }
+
+    /// NetFS may finish after cancellation. Retire only the exact mount this request
+    /// created, and never force an active copy out from under the user. A configuration
+    /// still using the same mount keeps it; its current operation will discover it.
+    private func reconcileSupersededMount(_ share: ShareConfiguration) async {
+        guard !shares.contains(where: { $0.isEnabled && $0.mountIdentity == share.mountIdentity }),
+              mountTable().isMounted(host: share.host, share: share.shareName, at: share.normalizedMountPoint)
+        else { return }
+        do {
+            try await operationRunner(for: share.host).unmount(
+                mounter, share: share, at: share.normalizedMountPoint, forcing: false, checkingCancellation: false
+            )
+        } catch {
+            appendLog("Previous mount for \(share.name) is busy; left it available for manual eject.", level: .warning)
+        }
+    }
+
     func mount(_ share: ShareConfiguration, explicit: Bool = false) {
         manuallyUnmounted.remove(share.id)
         if explicit {
             mountRetries.reset(share.id)
         }
-        guard share.isEnabled, operations[share.id] == nil else { return }
+        guard !isSleeping, share.isEnabled, operations[share.id] == nil,
+              shares.contains(where: { $0.id == share.id && $0.mountIdentity == share.mountIdentity && $0.isEnabled })
+        else { return }
+        if let blocked = blockedReconciliations[share.id] {
+            if mountTable().isMounted(host: blocked.share.host, share: blocked.share.shareName, at: blocked.mountPoint) {
+                guard explicit else { states[share.id] = .failed(blocked.message); return }
+                unmount(blocked.share, at: blocked.mountPoint, thenMount: share, evenWithoutAutoMount: true, forcing: false)
+                return
+            }
+            blockedReconciliations[share.id] = nil
+        }
         if explicit && !repairMounts.contains(share.id) {
             health.resetCooldown(share.id)
         }
 
-        let table = MountTable.current()
+        let table = mountTable()
         if let existingPoint = table.mountPoint(host: share.host, share: share.shareName) {
             let configuredPoint = share.normalizedMountPoint
             if existingPoint == configuredPoint {
@@ -720,16 +813,20 @@ final class SMBShareManager: NSObject {
             appendLog("Waiting for SMB endpoint \(share.host):445 for \(share.name).")
         }
 
+        let operationID = UUID()
+        operationIDs[share.id] = operationID
         operations[share.id] = Task { [weak self] in
             guard let self else { return }
-            defer { operations[share.id] = nil }
+            defer { finishOperation(for: share.id, operationID: operationID) }
 
             if explicit {
-                guard await endpointChecker.isReachable(
+                let reachable = await endpointChecker.isReachable(
                     host: share.host,
                     port: 445,
                     timeout: 3
-                ) else {
+                )
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
+                guard reachable else {
                     states[share.id] = .failed("SMB endpoint \(share.host) is not reachable.")
                     appendLog(
                         "\(share.name): \(share.host):445 is not reachable.",
@@ -752,7 +849,7 @@ final class SMBShareManager: NSObject {
                     try? await Task.sleep(for: .seconds(5))
                 }
 
-                guard !Task.isCancelled else { return }
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
                 guard reachable else {
                     states[share.id] = .failed("SMB endpoint did not become reachable within 120 seconds.")
                     appendLog("Timed out waiting for \(share.host):445.", level: .warning)
@@ -760,6 +857,7 @@ final class SMBShareManager: NSObject {
                 }
             }
 
+            guard ownsOperation(for: share.id, operationID: operationID) else { return }
             states[share.id] = .mounting
             appendLog("SMB endpoint is reachable; mounting \(share.name).")
 
@@ -767,7 +865,17 @@ final class SMBShareManager: NSObject {
                 guard let password = try credentialStore.password(for: share), !password.isEmpty else {
                     throw ShareBeaconError.credentialMissing
                 }
-                try await operationRunner(for: share.host).mount(mounter, share: share, password: password)
+                let cleanupFailed = try await operationRunner(for: share.host).mount(
+                    mounter, share: share, password: password, mountTable: mountTable
+                )
+                guard ownsOperation(for: share.id, operationID: operationID) else {
+                    if cleanupFailed {
+                        appendLog("Previous mount for \(share.name) is busy; left it available for manual eject.", level: .warning)
+                    } else {
+                        await reconcileSupersededMount(share)
+                    }
+                    return
+                }
                 states[share.id] = .mounted
                 mountRetries.reset(share.id)
                 appendLog("Mounted \(share.name) at \(share.normalizedMountPoint).")
@@ -776,7 +884,8 @@ final class SMBShareManager: NSObject {
                     appendLog("Restored Finder favorite for \(share.name).")
                 }
             } catch {
-                if let existingPoint = MountTable.current().mountPoint(forShareNamed: share.shareName) {
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
+                if let existingPoint = mountTable().mountPoint(host: share.host, share: share.shareName) {
                     let configuredPoint = share.normalizedMountPoint
                     adoptedMountPoints[share.id] = existingPoint == configuredPoint ? nil : existingPoint
                     states[share.id] = .mounted
@@ -811,17 +920,22 @@ final class SMBShareManager: NSObject {
 
     private func unmount(
         _ share: ShareConfiguration,
+        at mountPoint: String? = nil,
         thenMount replacement: ShareConfiguration?,
         evenWithoutAutoMount: Bool = false,
         forcing: Bool = true
     ) {
         guard operations[share.id] == nil else { return }
+        let point = mountPoint ?? adoptedMountPoints[share.id] ?? share.normalizedMountPoint
         states[share.id] = .unmounting
+        let operationID = UUID()
+        operationIDs[share.id] = operationID
         operations[share.id] = Task { [weak self] in
             guard let self else { return }
+            var succeeded = false
             defer {
-                operations[share.id] = nil
-                if let replacement,
+                if finishOperation(for: share.id, operationID: operationID), succeeded,
+                   let replacement,
                    shares.contains(where: { $0.id == replacement.id }),
                    replacement.isEnabled && (replacement.autoMount || evenWithoutAutoMount) {
                     mount(replacement, explicit: evenWithoutAutoMount)
@@ -832,9 +946,12 @@ final class SMBShareManager: NSObject {
                 try await operationRunner(for: share.host).unmount(
                     mounter,
                     share: share,
-                    at: adoptedMountPoints[share.id] ?? share.normalizedMountPoint,
+                    at: point,
                     forcing: forcing
                 )
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
+                succeeded = true
+                blockedReconciliations[share.id] = nil
                 adoptedMountPoints[share.id] = nil
                 if let current = shares.first(where: { $0.id == share.id }) {
                     states[share.id] = current.isEnabled ? .unmounted : .disabled
@@ -843,7 +960,17 @@ final class SMBShareManager: NSObject {
                 }
                 appendLog("Unmounted \(share.name).")
             } catch {
-                states[share.id] = .failed(error.localizedDescription)
+                guard ownsOperation(for: share.id, operationID: operationID) else { return }
+                if shares.contains(where: { $0.id == share.id }) {
+                    states[share.id] = .failed(error.localizedDescription)
+                    if replacement != nil || !forcing {
+                        blockedReconciliations[share.id] = BlockedReconciliation(
+                            share: share, mountPoint: point, message: error.localizedDescription
+                        )
+                    }
+                } else {
+                    states[share.id] = nil
+                }
                 appendLog("Failed unmounting \(share.name): \(error.localizedDescription)", level: .error)
             }
         }
@@ -862,8 +989,16 @@ final class SMBShareManager: NSObject {
     }
 
     func refreshMountStates() {
-        let table = MountTable.current()
+        let table = mountTable()
         for share in shares {
+            if let blocked = blockedReconciliations[share.id] {
+                if table.isMounted(host: blocked.share.host, share: blocked.share.shareName, at: blocked.mountPoint) {
+                    adoptedMountPoints[share.id] = blocked.mountPoint
+                    states[share.id] = .failed(blocked.message)
+                    continue
+                }
+                blockedReconciliations[share.id] = nil
+            }
             if let existingPoint = table.mountPoint(host: share.host, share: share.shareName) {
                 adoptedMountPoints[share.id] =
                     existingPoint == share.normalizedMountPoint ? nil : existingPoint
@@ -1015,7 +1150,7 @@ final class SMBShareManager: NSObject {
         }
     }
 
-    @objc private func didSleep() {
+    @objc func didSleep() {
         guard !isSleeping else { return }
         isSleeping = true
         retryTask?.cancel()
@@ -1027,6 +1162,7 @@ final class SMBShareManager: NSObject {
         deferredStatusTask = nil
         operations.values.forEach { $0.cancel() }
         operations.removeAll()
+        operationIDs.removeAll()
         appendLog("Mac is sleeping; pausing share monitoring.")
     }
 
@@ -1071,6 +1207,6 @@ final class SMBShareManager: NSObject {
     }
 
     private func appendLog(_ message: String, level: LogLevel = .info) {
-        AppLogger.shared.record(message, level: level)
+        log(message, level)
     }
 }
