@@ -308,7 +308,7 @@ final class NetworkSnapshot: NetworkLinkResolving {
         }
         let link = System.sourceAddress(toHost: host)
             .flatMap { owners[$0] }
-            .map { link(interfaceName: $0) }
+            .map { self.link(interfaceName: $0) }
         hostLinks.withLock { $0[key] = link }
         return link
     }
